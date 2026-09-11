@@ -68,6 +68,7 @@
         <button @click="showCustom = false">取消</button>
       </div>
       <div v-if="customError" class="error">{{ customError }}</div>
+      <div class="hint">区间为左闭右开：包含开始秒、不包含结束秒（查全天请将结束设为次日 00:00:00）</div>
     </div>
 
     <div class="chart-card">
@@ -117,32 +118,35 @@ const customError = ref('')
 const customRange = reactive({ start: 0, end: 0 }) // Unix 秒
 const MAX_SPAN_SEC = 31 * 86400 // 与后端跨度上限一致
 
+// 日期起点辅助: 返回今天偏移 offsetDays 天的 00:00:00 (本地时区)
+function startOfDay(offsetDays) {
+  const d = new Date()
+  d.setHours(0, 0, 0, 0)
+  d.setDate(d.getDate() + offsetDays)
+  return d
+}
+
 // 常用时间段快捷选项: 返回 [起, 止] Date
+// 注意: 后端查询为左闭右开区间 (ts >= start AND ts < end),
+// 因此"全天"类区间的结束时间必须取下一天 00:00:00,
+// 若取当天 23:59:59 会漏掉最后一秒的数据
 const quickRanges = [
   {
     label: '今天',
-    get: () => { const s = new Date(); s.setHours(0, 0, 0, 0); return [s, new Date()] },
+    get: () => [startOfDay(0), new Date()],
   },
   {
     label: '昨天',
-    get: () => {
-      const s = new Date(); s.setHours(0, 0, 0, 0)
-      const e = new Date(s.getTime() - 1000); s.setDate(s.getDate() - 1)
-      return [s, e]
-    },
+    get: () => [startOfDay(-1), startOfDay(0)],
   },
   {
     label: '前天',
-    get: () => {
-      const s = new Date(); s.setHours(0, 0, 0, 0)
-      const e = new Date(s.getTime() - 1000); s.setDate(s.getDate() - 2); e.setDate(e.getDate() - 1)
-      return [s, e]
-    },
+    get: () => [startOfDay(-2), startOfDay(-1)],
   },
   {
     label: '本周',
     get: () => {
-      const s = new Date(); s.setHours(0, 0, 0, 0)
+      const s = startOfDay(0)
       s.setDate(s.getDate() - ((s.getDay() + 6) % 7)) // 周一
       return [s, new Date()]
     },

@@ -107,6 +107,7 @@ button.primary { background: linear-gradient(90deg, #1565c0, #4527a0); border: n
 .custom-panel .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .custom-panel label { font-size: 13px; color: #8b96ad; }
 .custom-panel .error { font-size: 12px; color: #ff5252; }
+.custom-panel .hint { font-size: 12px; color: #5c6880; }
 
 input[type="datetime-local"] {
   background: #1e2940;
