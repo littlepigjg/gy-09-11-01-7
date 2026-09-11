@@ -36,9 +36,11 @@
     <div class="toolbar">
       <div class="group">
         <label>时间范围</label>
-        <button v-for="r in ranges" :key="r.sec" :class="{ active: rangeSec === r.sec }" @click="setRange(r.sec)">
+        <button v-for="r in ranges" :key="r.sec" :class="{ active: rangeMode === 'preset' && rangeSec === r.sec }" @click="setRange(r.sec)">
           {{ r.label }}
         </button>
+        <button :class="{ active: rangeMode === 'custom' }" @click="toggleCustomPanel">自定义</button>
+        <span v-if="rangeMode === 'custom'" class="range-text">{{ customRangeText }}</span>
       </div>
       <div class="group">
         <label>聚合</label>
@@ -50,6 +52,22 @@
         <button :class="{ active: live }" @click="toggleLive">{{ live ? '暂停实时' : '开启实时' }}</button>
         <button class="primary" @click="onQuery">刷新查询</button>
       </div>
+    </div>
+
+    <div v-if="showCustom" class="custom-panel">
+      <div class="row">
+        <label>快捷选择</label>
+        <button v-for="q in quickRanges" :key="q.label" @click="applyQuick(q)">{{ q.label }}</button>
+      </div>
+      <div class="row">
+        <label>开始</label>
+        <input type="datetime-local" step="1" v-model="customStartInput" />
+        <label>结束</label>
+        <input type="datetime-local" step="1" v-model="customEndInput" />
+        <button class="primary" @click="applyCustom">应用</button>
+        <button @click="showCustom = false">取消</button>
+      </div>
+      <div v-if="customError" class="error">{{ customError }}</div>
     </div>
 
     <div class="chart-card">
@@ -71,7 +89,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onBeforeUnmount, nextTick } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import * as echarts from 'echarts'
 
 const API = ''
@@ -90,6 +108,106 @@ const ranges = [
   { sec: 172800, label: '2天' },
 ]
 const rangeSec = ref(21600)
+// 自定义时间范围: 'preset' 走固定档位, 'custom' 走用户输入的起止时间(秒级)
+const rangeMode = ref('preset')
+const showCustom = ref(false)
+const customStartInput = ref('')
+const customEndInput = ref('')
+const customError = ref('')
+const customRange = reactive({ start: 0, end: 0 }) // Unix 秒
+const MAX_SPAN_SEC = 31 * 86400 // 与后端跨度上限一致
+
+// 常用时间段快捷选项: 返回 [起, 止] Date
+const quickRanges = [
+  {
+    label: '今天',
+    get: () => { const s = new Date(); s.setHours(0, 0, 0, 0); return [s, new Date()] },
+  },
+  {
+    label: '昨天',
+    get: () => {
+      const s = new Date(); s.setHours(0, 0, 0, 0)
+      const e = new Date(s.getTime() - 1000); s.setDate(s.getDate() - 1)
+      return [s, e]
+    },
+  },
+  {
+    label: '前天',
+    get: () => {
+      const s = new Date(); s.setHours(0, 0, 0, 0)
+      const e = new Date(s.getTime() - 1000); s.setDate(s.getDate() - 2); e.setDate(e.getDate() - 1)
+      return [s, e]
+    },
+  },
+  {
+    label: '本周',
+    get: () => {
+      const s = new Date(); s.setHours(0, 0, 0, 0)
+      s.setDate(s.getDate() - ((s.getDay() + 6) % 7)) // 周一
+      return [s, new Date()]
+    },
+  },
+  {
+    label: '最近7天',
+    get: () => [new Date(Date.now() - 7 * 86400000), new Date()],
+  },
+]
+
+// Date -> datetime-local 输入框格式 (本地时区, 精确到秒)
+function fmtInput(d) {
+  const p = n => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+// datetime-local 值按本地时区解析为 Unix 秒
+function parseInput(s) {
+  const t = new Date(s).getTime()
+  return Number.isNaN(t) ? NaN : Math.floor(t / 1000)
+}
+const fmtSec = ts => {
+  const p = n => String(n).padStart(2, '0')
+  const d = new Date(ts * 1000)
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+const customRangeText = computed(() =>
+  rangeMode.value === 'custom' ? `${fmtSec(customRange.start)} ~ ${fmtSec(customRange.end)}` : ''
+)
+
+// 当前生效的查询区间 [start, end] (Unix 秒)
+function effectiveRange() {
+  if (rangeMode.value === 'custom') return [customRange.start, customRange.end]
+  const end = Math.floor(Date.now() / 1000)
+  return [end - rangeSec.value, end]
+}
+
+function toggleCustomPanel() {
+  showCustom.value = !showCustom.value
+  if (showCustom.value) {
+    // 预填当前生效区间, 便于在现有档位基础上微调
+    const [s, e] = effectiveRange()
+    customStartInput.value = fmtInput(new Date(s * 1000))
+    customEndInput.value = fmtInput(new Date(e * 1000))
+    customError.value = ''
+  }
+}
+function applyQuick(q) {
+  const [s, e] = q.get()
+  customStartInput.value = fmtInput(s)
+  customEndInput.value = fmtInput(e)
+  customError.value = ''
+}
+function applyCustom() {
+  const start = parseInput(customStartInput.value)
+  const end = parseInput(customEndInput.value)
+  if (Number.isNaN(start) || Number.isNaN(end)) { customError.value = '请填写完整的起止时间'; return }
+  if (end <= start) { customError.value = '结束时间必须大于开始时间'; return }
+  if (end - start > MAX_SPAN_SEC) { customError.value = '时间跨度不能超过 31 天'; return }
+  customRange.start = start
+  customRange.end = end
+  rangeMode.value = 'custom'
+  showCustom.value = false
+  onQuery()
+}
+
 const agg = ref('avg')
 const live = ref(true)
 const liveWindow = 300
@@ -131,15 +249,14 @@ function toggleMetric(m) {
   else selected.value.push(m)
   onQuery()
 }
-function setRange(s) { rangeSec.value = s; onQuery() }
+function setRange(s) { rangeMode.value = 'preset'; rangeSec.value = s; onQuery() }
 function setAgg(a) { agg.value = a; onQuery() }
 function toggleLive() { live.value = !live.value; scheduleLive() }
 
 // ---------- 历史查询: 多指标对比 + 降采样 ----------
 async function onQuery() {
   if (!selected.value.length) { histInst.setOption({ series: [] }); return }
-  const end = Math.floor(Date.now() / 1000)
-  const start = end - rangeSec.value
+  const [start, end] = effectiveRange()
   const q = new URLSearchParams({
     metrics: selected.value.join(','),
     instance: instance.value,
@@ -147,6 +264,7 @@ async function onQuery() {
     agg: agg.value,
   })
   const data = await fetchJson('/api/query?' + q.toString())
+  if (data.detail) { queryMeta.elapsed = '查询失败: ' + data.detail; return }
   queryMeta.bucket = data.bucket_seconds
   queryMeta.source = data.source
   queryMeta.elapsed = data.elapsed_ms
@@ -163,7 +281,10 @@ async function onQuery() {
   }))
 
   // 对第一个选中指标做异常点检测, 在历史曲线上以红色散点标注
-  const anomalies = await fetchAnomalies(selected.value[0], start, end)
+  // 跨度超过 7 天后端会拒绝(需拉全部原始点), 前端直接跳过
+  const anomalies = (end - start) <= 7 * 86400
+    ? await fetchAnomalies(selected.value[0], start, end)
+    : []
   anomalyCount.value = anomalies.length
   if (anomalies.length) {
     series.push({

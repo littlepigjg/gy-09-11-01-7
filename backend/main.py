@@ -7,6 +7,7 @@
 #   3. 降采样: 固定桶大小时间窗口聚合 (LTTB 风格桶聚合)
 #   4. 自动路由: 大时间跨度查询命中小时级预聚合表
 #   5. 异常点检测: 基于滑动窗口 Z-Score
+#   6. 自定义时间范围: 任意秒级起止时间戳, 裸列常量比较保证分区裁剪
 # =============================================================
 import math
 import os
@@ -16,7 +17,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import pymysql
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -191,6 +192,21 @@ def list_metrics():
 # ---------------------------------------------------------------
 # API: 聚合查询 (min/max/avg/sum) + 降采样
 # ---------------------------------------------------------------
+# 查询跨度上限: 与原始数据 30 天保留期对齐(留 1 天余量),
+# 防止自定义时间范围误传超大跨度导致全表扫描
+MAX_QUERY_SPAN_SEC = 31 * 86400
+# 异常点检测需拉取原始点在 Python 侧计算, 跨度上限更严格
+MAX_ANOMALY_SPAN_SEC = 7 * 86400
+
+
+def _validate_range(start: float, end: float, max_span: int) -> None:
+    """校验自定义时间范围: 起止有序且跨度在上限内。"""
+    if end <= start:
+        raise HTTPException(400, "结束时间必须大于起始时间")
+    if end - start > max_span:
+        raise HTTPException(400, f"查询时间跨度不能超过 {max_span // 86400} 天")
+
+
 # 降采样桶大小映射: 根据查询时间跨度自动选择, 保证返回点数适中
 def _auto_bucket_seconds(start: float, end: float, target_points: int = 500) -> int:
     span = end - start
@@ -211,6 +227,7 @@ def query_metrics(
     agg: str = Query("avg", pattern="^(min|max|avg|sum)$"),
     bucket: Optional[int] = Query(None, description="降采样桶秒数, 缺省自动"),
     max_points: int = Query(500, le=5000),
+    debug: bool = Query(False, description="返回分区裁剪命中情况(EXPLAIN PARTITIONS)"),
 ):
     """
     聚合 + 降采样查询。
@@ -218,7 +235,14 @@ def query_metrics(
       - 将时间轴切分为固定 bucket 秒的桶
       - SQL: FLOOR(UNIX_TIMESTAMP(ts)/bucket) 分组, 组内计算 min/max/avg/sum
       - 大跨度(>7天)自动路由到 metric_data_hourly 预聚合表, 避免扫描原始分区
+    自定义时间范围说明:
+      - start/end 支持任意 Unix 秒级时间戳(快捷档位与自定义区间走同一入口)
+      - WHERE 条件为 ts >= %s AND ts < %s 的裸列常量比较, 且参数在客户端
+        插值为字面量, MySQL 优化器可在解析期完成 RANGE 分区裁剪,
+        任意起止时间都能只扫描命中的按天分区
+      - debug=true 时附带 EXPLAIN PARTITIONS 结果, 便于验证裁剪效果
     """
+    _validate_range(start, end, MAX_QUERY_SPAN_SEC)
     names = [m.strip() for m in metrics.split(",") if m.strip()]
     if not names:
         return {"series": {}}
@@ -235,6 +259,7 @@ def query_metrics(
     use_hourly = (end - start) > 7 * 86400 and bucket_sec >= 3600
 
     result: dict[str, list] = {}
+    hit_partitions: set[str] = set()
     t0 = time.perf_counter()
     with pool.acquire() as conn, conn.cursor() as cur:
         id_map = _resolve_metric_ids(cur, names, instance)
@@ -258,18 +283,28 @@ def query_metrics(
                     f"WHERE {id_cond} AND ts >= %s AND ts < %s "
                     "GROUP BY FLOOR(UNIX_TIMESTAMP(ts)/%s) ORDER BY bucket"
                 )
-            cur.execute(sql, (*mids, start_dt, end_dt, bucket_sec))
+            params = (*mids, start_dt, end_dt, bucket_sec)
+            cur.execute(sql, params)
             result[name] = [
                 {"ts": int(row["bucket"].timestamp()), "value": round(float(row["v"]), 4) if row["v"] is not None else None}
                 for row in cur.fetchall()
             ]
+            if debug:
+                # EXPLAIN PARTITIONS 验证分区裁剪: 只应列出时间范围覆盖的分区
+                cur.execute("EXPLAIN PARTITIONS " + sql, params)
+                for row in cur.fetchall():
+                    if row.get("partitions"):
+                        hit_partitions.update(row["partitions"].split(","))
     elapsed = (time.perf_counter() - t0) * 1000
-    return {
+    resp = {
         "bucket_seconds": bucket_sec,
         "source": "hourly" if use_hourly else "raw",
         "elapsed_ms": round(elapsed, 2),
         "series": result,
     }
+    if debug:
+        resp["partitions"] = sorted(hit_partitions)
+    return resp
 
 
 # ---------------------------------------------------------------
@@ -315,7 +350,9 @@ def detect_anomalies(
     """
     异常点标注: 对每个原始点, 用前 window 个点计算均值/标准差,
     |z| > threshold 判定为异常。返回异常点列表供前端高亮。
+    自定义大跨度查询需拉取全部原始点, 限制跨度 <= 7 天保护性能。
     """
+    _validate_range(start, end, MAX_ANOMALY_SPAN_SEC)
     start_dt = datetime.fromtimestamp(start)
     end_dt = datetime.fromtimestamp(end)
     with pool.acquire() as conn, conn.cursor() as cur:

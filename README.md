@@ -10,6 +10,7 @@
 - **降采样聚合**：SQL 侧时间桶聚合（min/max/avg/sum），桶大小按时间跨度自动对齐（1s~1d）
 - **预聚合加速**：小时级物化表，跨度 >7 天查询自动路由，30 天查询毫秒级返回
 - **异常点检测**：滑动窗口 Z-Score 算法，曲线上红色高亮标注
+- **自定义时间范围**：快捷档位（15分钟~2天）+ 任意起止时间选择器（精确到秒），内置"今天/昨天/本周"等快捷段；自定义区间与固定档位共用同一查询入口，同样命中分区裁剪
 - **实时可视化**：实时曲线、多指标对比、时间范围/聚合方式切换、图表缩放
 
 ## 快速开始
@@ -116,10 +117,13 @@ curl -X POST http://localhost:8000/api/write \
   -d '{"points":[{"metric":"cpu.usage","instance":"host-1","value":42.5}]}'
 ```
 
-聚合查询示例（时间戳为 Unix 秒）：
+聚合查询示例（时间戳为 Unix 秒，`start`/`end` 支持任意自定义区间）：
 
 ```bash
 curl "http://localhost:8000/api/query?metrics=cpu.usage,mem.usage&start=1788800000&end=1788900000&agg=avg"
+
+# 验证分区裁剪: debug=true 返回本次查询实际命中的分区列表
+curl "http://localhost:8000/api/query?metrics=cpu.usage&start=1788800000&end=1788900000&debug=true"
 ```
 
 ## 核心设计
